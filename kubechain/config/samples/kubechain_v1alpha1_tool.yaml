@@ -19,3 +19,7 @@ spec:
   execute:
     builtin:
       name: add
+status:
+  ready: true
+  status: "Ready"
+  statusDetail: "Tool is configured and ready to use"

@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"bytes"
+	"net/http"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -75,9 +77,7 @@ func (r *TaskRunToolCallReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// --- New direct execution logic ---
-	// For now, support only direct execution.
-	// If the tool is of type "delegateToAgent", return an error.
+	// Handle different tool types
 	if tool.Spec.ToolType == "delegateToAgent" {
 		err := fmt.Errorf("delegation is not implemented yet; only direct execution is supported")
 		logger.Error(err, "Delegation not implemented")
@@ -154,6 +154,192 @@ func (r *TaskRunToolCallReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		logger.Info("Direct execution completed", "result", res)
 		r.recorder.Event(&trtc, corev1.EventTypeNormal, "ExecutionSucceeded", fmt.Sprintf("Tool %q executed successfully", tool.Name))
+		return ctrl.Result{}, nil
+	} else if tool.Spec.ToolType == "externalAPI" {
+		// Handle external API tool call
+		if tool.Spec.Execute.ExternalAPI == nil {
+			err := fmt.Errorf("externalAPI tool missing execution details")
+			logger.Error(err, "Missing execution details")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = err.Error()
+			trtc.Status.Error = err.Error()
+			r.recorder.Event(&trtc, corev1.EventTypeWarning, "ValidationFailed", err.Error())
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		
+		// Get API key from secret
+		var apiKey string
+		if tool.Spec.Execute.ExternalAPI.CredentialsFrom != nil {
+			var secret corev1.Secret
+			err := r.Get(ctx, client.ObjectKey{
+				Namespace: trtc.Namespace,
+				Name:      tool.Spec.Execute.ExternalAPI.CredentialsFrom.Name,
+			}, &secret)
+			if err != nil {
+				logger.Error(err, "Failed to get API credentials")
+				trtc.Status.Status = "Error"
+				trtc.Status.StatusDetail = fmt.Sprintf("Failed to get API credentials: %v", err)
+				trtc.Status.Error = err.Error()
+				r.recorder.Event(&trtc, corev1.EventTypeWarning, "ValidationFailed", err.Error())
+				if err := r.Status().Update(ctx, &trtc); err != nil {
+					logger.Error(err, "Failed to update status")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, err
+			}
+			
+			apiKey = string(secret.Data[tool.Spec.Execute.ExternalAPI.CredentialsFrom.Key])
+			if apiKey == "" {
+				err := fmt.Errorf("empty API key in secret")
+				logger.Error(err, "Empty API key")
+				trtc.Status.Status = "Error"
+				trtc.Status.StatusDetail = err.Error()
+				trtc.Status.Error = err.Error()
+				r.recorder.Event(&trtc, corev1.EventTypeWarning, "ValidationFailed", err.Error())
+				if err := r.Status().Update(ctx, &trtc); err != nil {
+					logger.Error(err, "Failed to update status")
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, err
+			}
+		}
+		
+		// Parse the arguments for the API call
+		var args interface{}
+		if err := json.Unmarshal([]byte(trtc.Spec.Arguments), &args); err != nil {
+			logger.Error(err, "Failed to parse arguments")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = "Invalid arguments JSON"
+			trtc.Status.Error = err.Error()
+			r.recorder.Event(&trtc, corev1.EventTypeWarning, "ExecutionFailed", err.Error())
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		
+		// Make the API request
+		logger.Info("Making external API call", "url", tool.Spec.Execute.ExternalAPI.URL)
+		
+		// Prepare the request
+		reqBody, err := json.Marshal(args)
+		if err != nil {
+			logger.Error(err, "Failed to marshal request body")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = fmt.Sprintf("Failed to prepare request: %v", err)
+			trtc.Status.Error = err.Error()
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		
+		// Create HTTP client with timeout
+		client := &http.Client{
+			Timeout: 30 * time.Second,
+		}
+		
+		// Create request
+		req, err := http.NewRequestWithContext(
+			ctx, 
+			"POST", 
+			tool.Spec.Execute.ExternalAPI.URL, 
+			bytes.NewBuffer(reqBody),
+		)
+		if err != nil {
+			logger.Error(err, "Failed to create HTTP request")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = fmt.Sprintf("Failed to create HTTP request: %v", err)
+			trtc.Status.Error = err.Error()
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		
+		// Set headers
+		req.Header.Set("Content-Type", "application/json")
+		if apiKey != "" {
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+		}
+		
+		// Execute the request
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Error(err, "API request failed")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = fmt.Sprintf("API request failed: %v", err)
+			trtc.Status.Error = err.Error()
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		defer resp.Body.Close()
+		
+		// Check for non-success status code
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			err := fmt.Errorf("API returned non-success status: %d", resp.StatusCode)
+			logger.Error(err, "API returned error status")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = err.Error()
+			trtc.Status.Error = err.Error()
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		
+		// Read and parse the response
+		var result interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			logger.Error(err, "Failed to parse API response")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = fmt.Sprintf("Failed to parse API response: %v", err)
+			trtc.Status.Error = err.Error()
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		
+		// Convert result to JSON string
+		resultJSON, err := json.Marshal(result)
+		if err != nil {
+			logger.Error(err, "Failed to marshal result")
+			trtc.Status.Status = "Error"
+			trtc.Status.StatusDetail = fmt.Sprintf("Failed to format result: %v", err)
+			trtc.Status.Error = err.Error()
+			if err := r.Status().Update(ctx, &trtc); err != nil {
+				logger.Error(err, "Failed to update status")
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, err
+		}
+		
+		// Update TaskRunToolCall with the result
+		trtc.Status.Result = string(resultJSON)
+		trtc.Status.Phase = kubechainv1alpha1.TaskRunToolCallPhaseSucceeded
+		trtc.Status.Status = "Ready"
+		trtc.Status.StatusDetail = "API call executed successfully"
+		if err := r.Status().Update(ctx, &trtc); err != nil {
+			logger.Error(err, "Failed to update TaskRunToolCall status after execution")
+			return ctrl.Result{}, err
+		}
+		
+		logger.Info("API execution completed", "statusCode", resp.StatusCode)
+		r.recorder.Event(&trtc, corev1.EventTypeNormal, "ExecutionSucceeded", 
+			fmt.Sprintf("API call to %s executed successfully", tool.Spec.Execute.ExternalAPI.URL))
 		return ctrl.Result{}, nil
 	}
 

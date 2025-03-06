@@ -258,6 +258,13 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "TaskRun")
 		os.Exit(1)
 	}
+	if err = (&controller.TaskRunToolCallReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "TaskRunToolCall")
+		os.Exit(1)
+	}
 
 	if metricsCertWatcher != nil {
 		setupLog.Info("Adding metrics certificate watcher to manager")

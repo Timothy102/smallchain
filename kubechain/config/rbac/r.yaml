@@ -1,0 +1,21 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubechain-controller-manager
+rules:
+- apiGroups: ["kubechain.humanlayer.dev"]
+  resources: ["taskruntoolcalls"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubechain-controller-manager
+subjects:
+- kind: ServiceAccount
+  name: kubechain-controller-manager
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: kubechain-controller-manager
+  apiGroup: rbac.authorization.k8s.io

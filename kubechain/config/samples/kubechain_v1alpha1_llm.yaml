@@ -9,3 +9,7 @@ spec:
       name: openai
       key: OPENAI_API_KEY
   maxTokens: 1000
+status:
+  ready: true
+  status: "Ready"
+  statusDetail: "LLM is configured and ready"
