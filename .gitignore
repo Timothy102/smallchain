@@ -1,2 +1,4 @@
 ts/chains.db
-kubechain/config/secrets
+kubechain/config/secretskubechain/config/secrets/openai.yaml
+kubechain/config/secretskubechain/config/secrets/humanlayer.yaml
+kubechain/config/secretskubechain/config/secrets/
